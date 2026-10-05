@@ -520,8 +520,8 @@ docker manifest inspect <image> | jq -r '.manifests[].platform.architecture'
 
 ## 8. Known limitations
 
-- **No Widevine for aarch64 Linux.** Netflix, Spotify's web player and other DRM
-  video will not play in the guest. Nothing to configure; use the host.
+- **No Widevine for aarch64 Linux.** Netflix and other DRM video will not play in
+  the guest. Nothing to configure; use the host. (Spotify's web player does work.)
 - **GPU acceleration is limited.** virgl covers the desktop well; see
   [Electron apps](#4-electron-apps-refuse-to-start) for the main casualty.
 - **Two modifier spaces**, as above — plan your keymap around it.
@@ -635,6 +635,83 @@ hundreds of gigabytes available. **For anything the VM does, trust `df`:**
 ```bash
 df -h /System/Volumes/Data
 ```
+
+---
+
+## 11. Audio that drops out or crackles
+
+Two separate faults, with separate fixes. Both showed up as "YouTube stutters in
+the guest but plays cleanly on the Mac".
+
+### Dropouts of about a second: move audio off SPICE
+
+By default UTM carries the guest's sound over SPICE, the same connection that
+carries the display. During video the audio arrives late and whole chunks are
+dropped. Check which backend the running VM uses, on the host:
+
+```bash
+ps -o args= -p "$(pgrep -f QEMULauncher)" | tr ' ' '\n' | grep -A1 audiodev
+# -audiodev
+# spice,id=audio0          <- the default
+```
+
+Fix: **UTM → Settings → Sound Backend → CoreAudio** (the app's settings, not the
+VM's), then restart the VM. Keep the emulated card on Intel HD Audio: the
+aarch64 kernel is built without `CONFIG_SND_VIRTIO`, so with virtio-sound the
+guest finds no sound card at all and PipeWire falls back to a "Dummy" output.
+
+### Static-like blips while video plays: raise the PipeWire quantum
+
+With the dropouts gone, video still crackled, in the browser and in mpv, while
+audio-only playback of the same file was clean. The guest's sound card was
+underrunning: PipeWire hands it 1024 frames (21 ms) at a time, and that is not
+enough margin when software video decoding keeps the vCPUs busy. PipeWire counts
+every underrun in the `ERR` column of `pw-top`:
+
+```bash
+pw-top -b -n 2 | grep alsa_output      # run before and after ~20 s of video
+```
+
+| Quantum | Underruns during video |
+|---|---|
+| 1024 frames (21 ms, the default) | 12 in 12 s |
+| 2048 frames (42 ms) | 0 in 20 s |
+| 4096, 8192 | 0 in 20 s each |
+
+You can try a size live, without restarting anything (`0` puts it back):
+
+```bash
+pw-metadata -n settings 0 clock.force-quantum 2048
+```
+
+To make it permanent, create `~/.config/pipewire/pipewire.conf.d/10-vm-quantum.conf`:
+
+```
+context.properties = {
+    default.clock.quantum     = 2048
+    default.clock.min-quantum = 2048
+    default.clock.max-quantum = 8192
+    vm.overrides = {
+        default.clock.min-quantum = 2048
+    }
+}
+```
+
+The `vm.overrides` block is not optional. PipeWire detects that it is running in
+a VM and applies its own `vm.overrides` (minimum quantum 1024) on top of the
+normal properties, so without it the minimum silently stays at 1024. Then:
+
+```bash
+systemctl --user restart pipewire pipewire-pulse wireplumber
+pw-metadata -n settings 0 | grep quantum      # expect 2048 / 2048 / 8192
+```
+
+Players compensate for the extra 21 ms, so lip-sync is unaffected.
+
+**A trap when diagnosing this:** recording the output to inspect it
+(`parecord -d <sink>.monitor`) makes PipeWire run with larger buffers, and the
+blips disappear for as long as the recorder is attached. Count `ERR` in `pw-top`
+instead, and compare by ear with nothing recording.
 
 ---
 
