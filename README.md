@@ -263,6 +263,83 @@ python3 -c "import xml.dom.minidom;xml.dom.minidom.parse('$HOME/.config/fontconf
 fc-match -v monospace | grep -E 'hintstyle|rgba|lcdfilter'
 ```
 
+### Moving the VM window between a 1x and a Retina screen
+
+A pinned scale is right for one screen. Drag the UTM window from a 1x desktop
+monitor to the MacBook's Retina panel and everything in the VM is half size;
+drag it back and it is double. Two things make this awkward to automate:
+
+- **The VM cannot see which screen it is on.** The virtual EDID is the same
+  everywhere. The guest's pixel width does not tell you either, because a
+  windowed VM on a 5120-wide monitor is narrower than a full-screen one on a
+  3024-wide laptop.
+- **Moving the window changes nothing in the guest.** UTM keeps the guest at
+  the same pixel resolution and shows those pixels 1:1 on the new screen, so
+  no resolution event fires. Only a resize produces one.
+
+What works is asking macOS. This helper reports the backing scale factor of
+the screen that holds the UTM window, from the window list, so it needs no
+Accessibility permission and answers in a tenth of a second. Build it on the
+Mac with `swiftc -O -o ~/bin/utm-screen-scale utm-screen-scale.swift`:
+
+```swift
+// Print the backing scale factor (1 or 2) of the screen that holds UTM's
+// main window, so the Omarchy VM can pick its Hyprland scale from the real
+// display instead of guessing from the window size. Uses the window list
+// (no Accessibility permission needed for bounds). Output: "<scale> <WxH>".
+import AppKit
+
+let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+    fputs("no window list\n", stderr); exit(2)
+}
+var best: CGRect? = nil
+for w in list {
+    guard let owner = w[kCGWindowOwnerName as String] as? String, owner == "UTM",
+          let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+          let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+    let r = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
+    if r.width < 200 || r.height < 200 { continue }           // skip palettes/toolbars
+    if best == nil || r.width * r.height > best!.width * best!.height { best = r }
+}
+guard let win = best else { fputs("no UTM window\n", stderr); exit(3) }
+// Window bounds are in global top-left coordinates; NSScreen frames are
+// bottom-left with the primary screen's origin at 0,0.
+let primaryH = NSScreen.screens.first?.frame.height ?? 0
+let cx = win.midX, cy = primaryH - win.midY
+var chosen = NSScreen.main
+for s in NSScreen.screens where s.frame.contains(CGPoint(x: cx, y: cy)) { chosen = s }
+guard let screen = chosen else { fputs("no screen\n", stderr); exit(4) }
+let px = screen.frame.size.applying(CGAffineTransform(scaleX: screen.backingScaleFactor, y: screen.backingScaleFactor))
+print("\(Int(screen.backingScaleFactor)) \(Int(px.width))x\(Int(px.height))")
+```
+
+On the VM side, a script sets the Hyprland scale from that answer. Two
+details matter under Omarchy's Lua config: `hyprctl keyword` is gone, use
+`hyprctl eval`, and never pass `mode = "preferred"` for the virtual output,
+which is the EDID's 1280×800 fallback and collapses the desktop. Re-use the
+live mode instead:
+
+```bash
+mon=$(hyprctl -j monitors | jq -c '.[] | select(.name == "Virtual-1")')
+w=$(jq -r .width <<<"$mon"); h=$(jq -r .height <<<"$mon"); hz=$(jq -r '.refreshRate | floor' <<<"$mon")
+read -r want _ < <(ssh -o BatchMode=yes mac '~/bin/utm-screen-scale')   # 1 or 2
+hyprctl eval "hl.monitor({ output = \"Virtual-1\", mode = \"${w}x${h}@${hz}\", position = \"0x0\", scale = $want })"
+```
+
+Then run it from two triggers. A systemd user **path unit** on
+`~/.local/state/spice-guest-tools/display.state` covers resizes, since the
+SPICE display bridge records every new layout there (it re-applies layouts
+with whatever scale is already live, so it never changes the scale itself).
+A small **watch service** covers moves: it keeps one ssh session to the Mac
+running the helper once a second and applies the scale when the answer
+changes. With a standing agent tunnel that is one key signature per
+connection. In `monitors.lua`, keep the pin as a boot-time fallback.
+
+The Omarchy menu's font-size and scale settings are the wrong lever for this:
+they change the look on every screen, and you would be flipping them by hand
+on each move.
+
 ---
 
 ## 3. The pointer: scrolling and focus
