@@ -15,6 +15,11 @@ appears, it came from a command whose output is shown.
 **Host:** Apple M5 Max, 64 GB, macOS 27 · **Guest:** Omarchy 4.0.3 (aarch64),
 Hyprland 0.56.1 · **VM:** UTM 4.7.5, QEMU backend, 8 vCPU / 24 GB / 128 GB disk
 
+**Update, November 2026:** the image still installs Omarchy 4.0.3, and its
+package repository has not moved since. [Section 12](#12-updating-to-omarchy-45-switch-to-the-official-arm-packages)
+takes the same VM to **Omarchy 4.5** on Omarchy's own ARM packages, after which
+`omarchy update` works normally again.
+
 ---
 
 ## Is this the right route for you?
@@ -31,12 +36,15 @@ macOS** — you keep Xcode, iOS development, Secretive, and everything else on t
 host. The cost is graphics: see [Electron apps](#4-electron-apps-refuse-to-start)
 and [DRM](#8-known-limitations).
 
-You will need the **aarch64 packages**. The official distribution is x86-only;
-the aarch64 compatibility fork lives at
-[`riverscn/omarchy-aarch64`](https://github.com/riverscn/omarchy-aarch64). Note
-that fork is explicitly transitional — it tracks upstream and is intended to be
-archived once the architecture-neutral runtime hooks land upstream. Keep your
-customisation in `~/.config` and you will survive that transition.
+You will need the **aarch64 packages**. When this guide was written the official
+distribution was x86-only, and the aarch64 compatibility fork at
+[`riverscn/omarchy-aarch64`](https://github.com/riverscn/omarchy-aarch64) was the
+only source. That fork was explicitly transitional, and the transition has
+happened: since Omarchy 4.5 upstream publishes aarch64 packages itself. The
+fork's prebuilt image is still the quickest way to get a working VM, so the guide
+starts there and then moves the VM onto the official packages in
+[section 12](#12-updating-to-omarchy-45-switch-to-the-official-arm-packages).
+Keep your customisation in `~/.config` and it survives that move.
 
 ---
 
@@ -60,6 +68,11 @@ about **3.7 GB**, split across two parts. If you would rather not pipe a release
 asset straight into bash — reasonable — the release also ships
 `Omarchy-virt.utm.zip.sha256`, `image-provenance.txt` and an
 `image-package-inventory.zip`, so you can download, verify and unpack by hand.
+
+The image points pacman at the fork's package repository, which stopped at
+4.0.3. Once the VM works, follow
+[section 12](#12-updating-to-omarchy-45-switch-to-the-official-arm-packages) to
+get current.
 
 ### Exclude the image from Time Machine straight away
 
@@ -789,6 +802,200 @@ Players compensate for the extra 21 ms, so lip-sync is unaffected.
 (`parecord -d <sink>.monitor`) makes PipeWire run with larger buffers, and the
 blips disappear for as long as the recorder is attached. Count `ERR` in `pw-top`
 instead, and compare by ear with nothing recording.
+
+---
+
+## 12. Updating to Omarchy 4.5: switch to the official ARM packages
+
+The image installs Omarchy 4.0.3 and configures pacman to take Omarchy's packages
+from the fork's repository
+([`riverscn/omarchy-pkgs-aarch64`](https://github.com/riverscn/omarchy-pkgs-aarch64),
+release `aarch64-stable`). That repository last changed on 2026-09-09 and still
+carries `omarchy 4.0.3-1` on all three channels, so `omarchy update` finds
+nothing however long you wait.
+
+Upstream no longer needs the fork. Omarchy 4.5.0 (2026-11-05) publishes aarch64
+packages at `pkgs.omarchy.org`, keeps its own mirror of Arch Linux ARM, and
+recognises a generic ARM machine such as a UTM guest as the platform `aarch64`.
+Moving a VM built from the image onto those packages is a **one-time switch of
+two pacman files**. After it, updates arrive through `omarchy update` like on
+any other Omarchy machine.
+
+Done here once, on 2026-11-15, on a VM installed from `v4.0.3-virt.1`:
+4.0.3-1 to 4.5.0-3, Hyprland 0.56.1 to 0.56.2, kernel 7.2.6 to 7.2.11. The
+transaction was 342 packages, 21 of them new, a 1.9 GB download with no
+conflicts, and the update took four and a half minutes.
+
+### Rehearse on a clone first
+
+A VM makes this cheap. Shut the VM down, right-click it in UTM and choose
+**Clone**, then run everything below in the clone while the original stays off.
+
+- The clone is a full copy, **including every key and token** in the guest.
+  Delete it when you are done.
+- In the clone, turn off anything that writes somewhere shared before you start:
+  backup timers, sync jobs, anything that would run twice.
+- If other machines reach the guest by IP, give the clone the original's MAC
+  address in UTM's network settings so it gets the same lease.
+
+Even without a clone you have a way back: `omarchy update` takes a snapper
+snapshot first, and the boot menu can start it.
+
+### 1. Keep the fork's configuration
+
+```bash
+sudo cp -a /etc/pacman.conf /etc/pacman.conf.fork
+sudo cp -a /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.fork
+```
+
+### 2. Install Omarchy's own aarch64 pacman files
+
+They are the templates Omarchy 4.5 ships in `default/pacman/aarch64/`. Fetch them
+from the release tag, read them, then install them:
+
+```bash
+base=https://raw.githubusercontent.com/omacom/omarchy/v4.5.0/default/pacman/aarch64
+curl -fsSL "$base/pacman-stable.conf" -o /tmp/pacman.conf
+curl -fsSL "$base/mirrorlist-stable"  -o /tmp/mirrorlist
+cat /tmp/pacman.conf /tmp/mirrorlist
+
+sudo install -m644 /tmp/pacman.conf /etc/pacman.conf
+sudo install -m644 /tmp/mirrorlist  /etc/pacman.d/mirrorlist
+```
+
+The parts that matter:
+
+```
+[omarchy]
+Server = https://pkgs.omarchy.org/stable/$arch
+
+[core] / [extra] / [alarm]
+Include = /etc/pacman.d/mirrorlist     ->  https://arm-stable-mirror.omarchy.org/$arch/$repo
+```
+
+The fork's `Include = /etc/pacman.d/omarchy-aarch64.conf` line and its `[aur]`
+repository are gone. Omarchy's packages are signed with the key from
+`omarchy-keyring`; the first step of `omarchy update` fetches and trusts that
+key if the machine does not have it yet.
+
+### 3. Delete the fork's downloaded package databases
+
+```bash
+sudo rm -f /var/lib/pacman/sync/omarchy.db /var/lib/pacman/sync/omarchy.db.sig /var/lib/pacman/sync/aur.db
+```
+
+Do not skip this. The fork signs its database and the official repository does
+not, so pacman downloads the new `omarchy.db`, checks it against the fork's old
+signature file, and the update stops with:
+
+```
+error: omarchy: signature from "Omarchy AArch64 Repository <...>" is invalid
+error: failed to synchronize all databases (unexpected error)
+```
+
+### 4. Disable the fork's pacman hook
+
+```bash
+cd ~/.config/omarchy/hooks/pre-refresh-pacman.d
+mv omarchy-aarch64-repository omarchy-aarch64-repository.sample
+```
+
+The image puts this hook in every home directory. It runs on
+`omarchy refresh pacman` and writes the fork's repository back into
+`/etc/pacman.conf`. Omarchy skips hook files that end in `.sample`. A copy sits
+in `/etc/skel/.config/omarchy/hooks/pre-refresh-pacman.d/` for accounts created
+later; rename that one too if you add users.
+
+### 5. Update
+
+```bash
+omarchy update
+```
+
+Run it in a terminal, or from the menu. What to expect:
+
+- One migration asks to replace a package:
+  `omarchy-power-profiles-daemon and power-profiles-daemon are in conflict.
+  Remove power-profiles-daemon? [y/N]`. Answer **y**.
+- At the end it offers to remove two orphaned packages (`hyprwayland-scanner`,
+  `gst-plugin-gtk`). Yes is fine.
+- These messages are harmless: `directory permissions differ on /boot/...`,
+  `local (...) is newer than omarchy (...)` for a couple of packages, and
+  `sysctl: setting key "net.core.default_qdisc": No such file or directory`.
+- It finishes by asking for a reboot (new kernel, new Hyprland). Reboot.
+
+### 6. Check the result
+
+```bash
+omarchy version                 # 4.5.0-3
+omarchy-hw-platform             # aarch64
+omarchy-channel-current         # stable
+omarchy-update-available        # Omarchy is up to date
+hyprctl configerrors            # prints nothing
+systemctl --failed; systemctl --user --failed
+
+# Omarchy's own reset now produces exactly what you installed by hand:
+diff /etc/pacman.conf /usr/share/omarchy/default/pacman/aarch64/pacman-stable.conf
+```
+
+Everything that depends on the VM plumbing kept working here: the shared folders,
+the clipboard in both directions through the SPICE agent, display resizing, the
+audio device and Docker.
+
+### What still comes from the fork
+
+Four installed packages have no counterpart in the official repository. They stay
+at the version the image shipped and will not update:
+
+| Package | What it does |
+|---|---|
+| `omarchy-spice-guest-tools` | clipboard and display bridge to the Mac |
+| `bindfs` | used by the shared-folder mounts |
+| `omarchy-aarch64-config` | two package lists under `/usr/share/omarchy/system/` |
+| `omarchy-aarch64-keyring` | the fork's signing key, no longer used |
+
+Leave the first two installed. If a later update breaks one of them, that is a
+manual fix: nobody upstream tests UTM guests.
+
+### If you have customised your setup
+
+Omarchy 4.5 changed a few things that local customisations lean on:
+
+- **New default keybindings** can land on keys you bound yourself, and then both
+  actions fire. `SUPER+A` (Select all), `SUPER+SHIFT+T` (Activity) and
+  `SUPER+SHIFT+I` (Switch input language back) are new. List chords that are
+  bound more than once:
+
+  ```bash
+  hyprctl binds -j | jq -r '.[] | select(.key != "") | "\(.modmask) \(.key)"' | sort | uniq -d
+  ```
+
+  `8 TAB` and `9 TAB` (Alt+Tab), `8 Alt_R` and `0 F9` (push-to-talk dictation)
+  are double-bound by Omarchy itself. For any other line, put an unbind such as
+  `hl.unbind("SUPER + A")` before your own binding in
+  `~/.config/hypr/bindings.lua`.
+- **The power commands were renamed.** `omarchy-system-logout`,
+  `omarchy-system-reboot` and `omarchy-system-shutdown` are gone; it is now
+  `omarchy-system logout|reboot|shutdown`. Scripts and menu overrides that call
+  the old names stop working, which you would otherwise discover when Reboot does
+  nothing.
+- **The Style menu is now Appearance.** Menu overrides keyed `style.*` (for
+  example `style.theme`) need the new id (`appearance.theme`).
+- **Cloned shell plugins stay as cloned.** A plugin you cloned on 4.0.3 keeps
+  working but does not pick up upstream's changes. The notifications plugin in
+  particular was rewritten.
+
+### Going back
+
+Before step 5 nothing is installed yet: restore the two `.fork` files, delete
+`/var/lib/pacman/sync/omarchy.db` and rename the hook back. After the update,
+the way back is the pre-update snapshot in the boot menu, or, on a clone,
+deleting the clone.
+
+### From here on
+
+`omarchy update` is all it takes. For a large release, the clone rehearsal is
+still worth ten minutes.
 
 ---
 
