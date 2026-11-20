@@ -366,6 +366,133 @@ the touchpad natural-scroll setting is inert. Set it on input instead:
 hl.config({ input = { natural_scroll = true } })
 ```
 
+### Sideways scrolling never arrives
+
+Swipe left or right on a Magic Mouse or trackpad over a wide page in the VM and
+nothing happens, in any application. It is not the browser. None of the pointer
+devices UTM gives the guest has a horizontal wheel:
+
+```
+$ grep -E '^N:|^B: REL' /proc/bus/input/devices
+N: Name="QEMU QEMU USB Tablet"
+B: REL=900
+N: Name="QEMU QEMU USB Mouse"
+B: REL=903
+N: Name="spice vdagent tablet"
+B: REL=100
+```
+
+Bit 8 is the vertical wheel and bit 11 its high-resolution twin. The horizontal
+wheel would be bit 6 (`REL=943` for the mouse), and no device has it, so the
+swipe is dropped on the Mac side of the fence.
+
+**Without installing anything:** hold Shift and scroll vertically. Chromium and
+most Linux applications treat that as horizontal scrolling.
+
+**To make the swipe itself work**, forward it around UTM. Two small programs in
+[`horizontal-scroll/`](horizontal-scroll/) do it:
+
+- [`utm-hscroll-send.swift`](horizontal-scroll/utm-hscroll-send.swift) runs on
+  the Mac. It watches scroll events and, while the pointer is over the VM
+  window, writes each horizontal gesture as lines `H <dx>` to `127.0.0.1:4749`.
+  It needs **no Accessibility or Input Monitoring permission**: macOS lets any
+  process monitor scroll-wheel events (key events are the ones that need a
+  grant), and window positions come from the window list.
+- [`utm-hscroll-receive`](horizontal-scroll/utm-hscroll-receive) runs in the
+  guest. It replays each line as a horizontal axis event from a virtual pointer,
+  which applications see as ordinary sideways scrolling. It speaks the
+  `wlr-virtual-pointer` protocol directly on the Wayland socket, so there is
+  nothing to install.
+
+An ssh forward joins the two. Both ends stay on loopback.
+
+On the Mac, build the sender:
+
+```bash
+mkdir -p ~/bin
+swiftc -O -o ~/bin/utm-hscroll-send utm-hscroll-send.swift
+```
+
+Start it at login with `~/Library/LaunchAgents/local.utm-hscroll-send.plist`
+(put your own user name in the path):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>local.utm-hscroll-send</string>
+	<key>ProgramArguments</key><array><string>/Users/YOU/bin/utm-hscroll-send</string></array>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>StandardErrorPath</key><string>/tmp/utm-hscroll-send.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.utm-hscroll-send.plist
+```
+
+Create these files in Terminal or over ssh, not by copying them out of a UTM
+shared folder: files that arrive through the share are quarantined, and launchd
+refuses a quarantined plist.
+
+In the guest, install the receiver and run it as a user service,
+`~/.config/systemd/user/utm-hscroll-receive.service`:
+
+```bash
+install -m 755 utm-hscroll-receive ~/.local/bin/
+```
+
+```ini
+[Unit]
+Description=Replay horizontal scrolling sent by the Mac
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/utm-hscroll-receive
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+```bash
+systemctl --user enable --now utm-hscroll-receive.service
+```
+
+Then carry the port. From the guest, a remote forward makes the Mac's
+`127.0.0.1:4749` reach the guest's:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -R 4749:127.0.0.1:4749 mac
+```
+
+If you already keep an ssh connection open between the two machines, add the
+forward to that one (`RemoteForward` from the guest, or `LocalForward` if the
+connection starts on the Mac). Otherwise run the command above from its own
+user service with `Restart=always`. The sender reconnects by itself within a
+second of the forward coming up.
+
+Details that turned out to matter:
+
+- **A gesture is horizontal or vertical as a whole.** A vertical scroll on a
+  Magic Mouse carries a steady sideways wobble. The sender decides on the first
+  4 points of travel and sends nothing for a vertical gesture, momentum
+  included.
+- **Shift is left alone.** macOS itself reports Shift + vertical scrolling as
+  horizontal, and the guest already handles Shift + wheel, so forwarding those
+  events would scroll twice.
+- **Direction.** The receiver scrolls in the traditional direction. If you
+  prefer the content to follow your fingers, add `Environment=HSCROLL_NATURAL=1`
+  to the service. `HSCROLL_GAIN=1.5` and the like change the distance.
+- **Compositor.** The virtual pointer protocol is the wlroots one. Hyprland has
+  it; a compositor without it makes the receiver log
+  `the compositor has no zwlr_virtual_pointer_manager_v1`.
+
 ### Typing goes to the wrong pane when you come back to the VM
 
 With two panes side by side, switch to a Mac app and back, start typing — and

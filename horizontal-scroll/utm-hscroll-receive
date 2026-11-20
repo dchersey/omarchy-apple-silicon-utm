@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""utm-hscroll-receive: replay horizontal scrolling sent by utm-hscroll-send.
+
+UTM's pointer devices have no horizontal wheel, so the Mac's sideways swipe
+never reaches the guest by itself. The Mac helper sends lines "H <dx>" (points,
+macOS sign: positive moves the content right) to 127.0.0.1:4749; this replays
+each as a horizontal axis event from a virtual pointer, which every Wayland
+application sees as ordinary horizontal scrolling.
+
+The virtual pointer is wlr-virtual-pointer-unstable-v1 (Hyprland, Sway and
+other wlroots-style compositors), spoken directly on the Wayland socket so
+nothing has to be installed.
+
+Environment:
+  HSCROLL_PORT     port to listen on, loopback only (default 4749)
+  HSCROLL_GAIN     multiply the distance (default 1.0)
+  HSCROLL_NATURAL  set to 1 for natural scrolling (the content follows the
+                   fingers); the default is the traditional direction
+"""
+import os, socket, struct, sys, threading, time
+
+PORT = int(os.environ.get("HSCROLL_PORT", 4749))
+GAIN = float(os.environ.get("HSCROLL_GAIN", 1.0))
+NATURAL = os.environ.get("HSCROLL_NATURAL", "") not in ("", "0")
+
+
+class VirtualPointer:
+    MANAGER = "zwlr_virtual_pointer_manager_v1"
+
+    def __init__(self):
+        path = os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ.get("WAYLAND_DISPLAY", "wayland-1"))
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(3)
+        self.sock.connect(path)
+        self.buf = b""
+        registry, callback, manager, self.pointer = 2, 3, 4, 5
+        self._send(1, 1, struct.pack("=I", registry))  # wl_display.get_registry
+        self._send(1, 0, struct.pack("=I", callback))  # wl_display.sync
+        name, done = None, False
+        while not done:
+            for obj, op, body in self._read():
+                if obj == registry and op == 0:        # wl_registry.global
+                    gname, slen = struct.unpack_from("=II", body)
+                    if body[8:8 + slen - 1].decode() == self.MANAGER:
+                        name = gname
+                elif obj == callback and op == 0:      # wl_callback.done
+                    done = True
+                else:
+                    self._check(obj, op, body)
+        if name is None:
+            raise OSError("the compositor has no " + self.MANAGER)
+        iface = self.MANAGER.encode() + b"\0"
+        iface += b"\0" * (-len(iface) % 4)
+        self._send(registry, 0, struct.pack("=II", name, len(self.MANAGER) + 1) + iface
+                   + struct.pack("=II", 1, manager))   # wl_registry.bind, version 1
+        self._send(manager, 0, struct.pack("=II", 0, self.pointer))  # create_virtual_pointer(seat = none)
+        self.sock.setblocking(False)
+
+    def _send(self, obj, opcode, body=b""):
+        self.sock.sendall(struct.pack("=II", obj, ((8 + len(body)) << 16) | opcode) + body)
+
+    @staticmethod
+    def _check(obj, op, body):
+        if obj == 1 and op == 0:                       # wl_display.error
+            raise OSError("wayland: " + body[12:].split(b"\0")[0].decode(errors="replace"))
+
+    def _read(self):
+        data = self.sock.recv(65536)
+        if not data:
+            raise OSError("wayland connection closed")
+        self.buf += data
+        out = []
+        while len(self.buf) >= 8:
+            obj, word = struct.unpack_from("=II", self.buf)
+            size = word >> 16
+            if size < 8 or len(self.buf) < size:
+                break
+            out.append((obj, word & 0xFFFF, self.buf[8:size]))
+            self.buf = self.buf[size:]
+        return out
+
+    def scroll_x(self, pixels):
+        """Positive scrolls right, as wl_pointer's horizontal axis does."""
+        try:
+            while True:                                # nothing is expected back; keep the socket empty
+                for msg in self._read():
+                    self._check(*msg)
+        except BlockingIOError:
+            pass
+        now = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        self._send(self.pointer, 5, struct.pack("=I", 2))                                   # axis_source: continuous
+        self._send(self.pointer, 3, struct.pack("=IIi", now, 1, int(round(pixels * 256))))  # axis: horizontal, 24.8 fixed
+        self._send(self.pointer, 4)                                                         # frame
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+lock = threading.Lock()
+pointer = None
+
+
+def scroll(dx):
+    """dx in Mac points, positive when the content moves right."""
+    global pointer
+    # wl_pointer: positive scrolls right, which moves the content left.
+    value = dx * GAIN * (-1 if NATURAL else 1)
+    with lock:
+        for attempt in (1, 2):                         # once more on a fresh connection if the old one died
+            try:
+                if pointer is None:
+                    pointer = VirtualPointer()
+                pointer.scroll_x(value)
+                return
+            except OSError as e:
+                if pointer is not None:
+                    pointer.close()
+                pointer = None
+                if attempt == 2:
+                    print(f"not replayed: {e}", file=sys.stderr, flush=True)
+
+
+def serve(conn):
+    with conn:
+        for line in conn.makefile("r", encoding="utf-8", errors="replace"):
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "H":
+                try:
+                    scroll(float(parts[1]))
+                except ValueError:
+                    pass
+
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen(4)
+    print(f"listening on 127.0.0.1:{PORT} ({'natural' if NATURAL else 'traditional'} direction)", flush=True)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
