@@ -486,9 +486,11 @@ Details that turned out to matter:
 - **Shift is left alone.** macOS itself reports Shift + vertical scrolling as
   horizontal, and the guest already handles Shift + wheel, so forwarding those
   events would scroll twice.
-- **Direction.** The receiver scrolls in the traditional direction. If you
-  prefer the content to follow your fingers, add `Environment=HSCROLL_NATURAL=1`
-  to the service. `HSCROLL_GAIN=1.5` and the like change the distance.
+- **Direction.** A swipe does what the same swipe does on the Mac, whichever
+  way the Mac's natural scrolling switch is set: macOS counts a move of the
+  content to the right as positive, Wayland counts it as negative, and the
+  receiver turns the sign over. `Environment=HSCROLL_INVERT=1` in the service
+  scrolls the other way; `HSCROLL_GAIN=1.5` and the like change the distance.
 - **Compositor.** The virtual pointer protocol is the wlroots one. Hyprland has
   it; a compositor without it makes the receiver log
   `the compositor has no zwlr_virtual_pointer_manager_v1`.

@@ -14,14 +14,15 @@ nothing has to be installed.
 Environment:
   HSCROLL_PORT     port to listen on, loopback only (default 4749)
   HSCROLL_GAIN     multiply the distance (default 1.0)
-  HSCROLL_NATURAL  set to 1 for natural scrolling (the content follows the
-                   fingers); the default is the traditional direction
+  HSCROLL_INVERT   set to 1 to scroll the other way; by default a swipe does
+                   what it does on the Mac, whichever way the Mac's natural
+                   scrolling switch is set
 """
 import os, socket, struct, sys, threading, time
 
 PORT = int(os.environ.get("HSCROLL_PORT", 4749))
 GAIN = float(os.environ.get("HSCROLL_GAIN", 1.0))
-NATURAL = os.environ.get("HSCROLL_NATURAL", "") not in ("", "0")
+INVERT = os.environ.get("HSCROLL_INVERT", "") not in ("", "0")
 
 
 class VirtualPointer:
@@ -106,8 +107,8 @@ pointer = None
 def scroll(dx):
     """dx in Mac points, positive when the content moves right."""
     global pointer
-    # wl_pointer: positive scrolls right, which moves the content left.
-    value = dx * GAIN * (-1 if NATURAL else 1)
+    # macOS: positive dx moves the content right. wl_pointer: positive moves it left.
+    value = -dx * GAIN * (-1 if INVERT else 1)
     with lock:
         for attempt in (1, 2):                         # once more on a fresh connection if the old one died
             try:
@@ -139,7 +140,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", PORT))
     srv.listen(4)
-    print(f"listening on 127.0.0.1:{PORT} ({'natural' if NATURAL else 'traditional'} direction)", flush=True)
+    print(f"listening on 127.0.0.1:{PORT} (direction: {'inverted' if INVERT else 'as on the Mac'})", flush=True)
     while True:
         conn, _ = srv.accept()
         threading.Thread(target=serve, args=(conn,), daemon=True).start()
